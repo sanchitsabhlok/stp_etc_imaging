@@ -15,24 +15,34 @@ from synphot import units, SourceSpectrum, SpectralElement, Observation, Empiric
 from synphot.models import BlackBodyNorm1D, GaussianFlux1D, Box1D
 import numpy as np
 from numpy import sqrt
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, RegularGridInterpolator
 import pandas as pd
 from math import ceil, floor, log10
+from . import get_data_path
+import logging
+import sys
+
+#   Module level logger. Handlers are attached when the first Observatory object is created.
+logger = logging.getLogger(__name__)
 
 ### Defining Classes
 
 try:
     import config_stp
 except:
-    print("config_stp could not be imported. Please check installation.")
+    logger.warning("config_stp could not be imported. Please check installation.")
 try:
     import config_um
 except:
-    print("config_um could not be imported. Please check installation.")
+    logger.warning("config_um could not be imported. Please check installation.")
 try:
     import config_stp_wcc
 except:
-    print("config_stp could not be imported. Please check installation.")
+    logger.warning("config_stp_wcc could not be imported. Please check installation.")
+try:
+    import config_um_wcc
+except:
+    logger.warning("config_um_wcc could not be imported. Please check installation.")
 
 import utils_config
 data_stp_wcc = config_stp_wcc.load_config_values()
@@ -45,7 +55,25 @@ class Observatory:
     
     attribute = "space observatory"
     
-    def __init__(self, telescope_name):
+    def __init__(self, telescope_name, logger=None, log_file=None):
+
+        #   Use the user supplied logger, else default to the module logger writing to the terminal/notebook console.
+        if logger is None:
+            logger = logging.getLogger(__name__)
+            if not logger.handlers:
+                console_handler = logging.StreamHandler(sys.stdout)
+                console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+                logger.addHandler(console_handler)
+                logger.setLevel(logging.INFO)
+                logger.propagate = False
+        #   Optionally also log to a file
+        if log_file is not None:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s'))
+            logger.addHandler(file_handler)
+        self.logger = logger
+
+        self.data_path = get_data_path()
 
         self.name = telescope_name
         self.diameter_primary = None
@@ -84,6 +112,8 @@ class Observatory:
         self.bg_surface_brightness = None   #   The surface brightness of the background source
         self.bg_magnitude = None        #   The AB magnitude of the background source (Requires PSF area to calculate)
         self.zero_mag_counts = None     #   Source counts for an AB mag = 0 PSF
+        self.encircled_energy = 1.0
+        self.jitter_interpolator = None
 
     def add_qe_curve(self, qe_fits_file, wave_unit='angstrom', num_curves=1, plot=False):
                 
@@ -110,7 +140,10 @@ class Observatory:
         if sensor_area is None:
             sensor_area = 36*u.mm * 24*u.mm
         if sensor_pixel_size is None:
-            sensor_pixel_size = 3.76*(u.um/u.pix)
+            if sensor_toml is not None:
+                sensor_pixel_size = (sensor_toml['pixel_size']['value'] * u.Unit(sensor_toml['pixel_size']['unit'])).to(u.um) / u.pix
+            else:
+                sensor_pixel_size = 3.76*(u.um/u.pix)
 
         #   plate scale [arcsecond/pixel] = pixel size / (telescope diameter * f#)  * ( 206265 * arcseconds/radian)
         self.plate_scale = (sensor_pixel_size.value * 1e-6 /self.diameter_primary['value'] / self.f_num * 206265)
@@ -163,8 +196,10 @@ class Observatory:
         self.num_mirrors += num_curves
         mirror_qe_fits_file = prepend_if_not_none(support_data_path,mirror_qe_fits_file)
         self.qe_curves.append(f"{mirror_qe_fits_file} x {num_curves}")
-        
-        bp = SpectralElement.from_file(mirror_qe_fits_file, wave_unit=wave_unit)
+        try:
+            bp = SpectralElement.from_file(mirror_qe_fits_file, wave_unit=wave_unit)
+        except:
+            bp = SpectralElement.from_file(mirror_qe_fits_file, wave_unit=u.nm)
         for num in range(num_curves-1):
             bp *= SpectralElement.from_file(mirror_qe_fits_file, wave_unit=wave_unit)
         self.bandpass *= bp
@@ -193,17 +228,25 @@ class Observatory:
         if plot==True:
             bp.plot(title=plot_title)
     
-    def calc_PSF(self, wavelength=None, approx_type='sq', verbose=False):
+    def calc_PSF(self, wavelength=None, approx_type='sq', aperture_diameter=None, jitter=None, verbose=False):
         # Calculate the mean PSF based on the mean wavelength of combined Spectral Elements
         # OR from a user-selected wavelength
 
-        if not wavelength == None:
-            psf_diameter = 2*1.22*wavelength*self.f_num
+        if aperture_diameter is None:
+            if not wavelength == None:
+                psf_diameter = 2*1.22*wavelength*self.f_num
+            else:
+                #   TODO: This implementation is definitely broken. Current workaround, always pass aperture_diameter.
+                #   Need to fix this before update.
+                wavelength = self.bandpass.wpeak()
+                self.qe_wpeak = wavelength
+                psf_diameter = (2*1.22*wavelength*self.f_num)
+                aperture_diameter = psf_diameter.to(u.um) / self.pixel_size / u.pix * self.plate_scale * 1e3
         else:
-            wavelength = self.bandpass.wpeak()
-            self.qe_wpeak = wavelength
-            psf_diameter = (2*1.22*wavelength*self.f_num)
-            
+            # Aperture diameter must be in milliarcseconds
+            # Convert from arcseconds to um
+            psf_diameter = (aperture_diameter.value / 1e3) / self.plate_scale * self.pixel_size * u.pix
+
         self.psf_diameter = psf_diameter.to('um')
         
         # determine total number of pixels with the psf
@@ -227,9 +270,9 @@ class Observatory:
 
         #   Calculate the total magnitude of the background spectrum given the PSF area (in square arcseconds)
         self.calculate_bg_normalization_magnitude()
-
+        self.set_encircled_energy(aperture_diameter= aperture_diameter.value, jitter=jitter)
         if verbose:
-            print(f"Number of PSF pixels: {self.num_psf_pixels}")
+            self.logger.info(f"Number of PSF pixels: {self.num_psf_pixels}")
         return psf_diameter, self.num_psf_pixels
         
     def make_STP(self, plot=False, filters=True, sensor=True, mirrors=True, bg_sb = None, custom_toml_dir = None,
@@ -256,10 +299,10 @@ class Observatory:
             support_data_telescope = config_um.get_data_path()
         if self.name == 'custom_toml':
             if custom_toml_dir is None:
-                print("Directory for custom toml files must be provided. Exiting...")
+                self.logger.error("Directory for custom toml files must be provided. Exiting...")
                 exit()
             if support_data_dir is None:
-                print("Support data directory for custom configuration must be provided. Exiting...")
+                self.logger.error("Support data directory for custom configuration must be provided. Exiting...")
                 exit()
             custom_loader = utils_config.ConfigLoader(custom_toml_dir, "parsed")
             data_telescope = custom_loader.load_configs()
@@ -268,12 +311,22 @@ class Observatory:
 
 
         self.data_observatory = data_telescope
-        self.data_wcc = config_stp_wcc.load_config_values("parsed")
+        if self.name in ['UM', 'test_UM']:
+            self.data_wcc = config_um_wcc.load_config_values("parsed")
+            support_data_wcc = config_um_wcc.get_data_path()
+        else:
+            self.data_wcc = config_stp_wcc.load_config_values("parsed")
+            support_data_wcc = config_stp_wcc.get_data_path()
+
+        #   Select the sensor section. If 'sensor_name' is provided, use the corresponding [sensor.<sensor_name>] table.
+        self.data_sensor = self.data_wcc['common_params']['sensor']
+        if 'sensor_name' in self.data_sensor:
+            self.data_sensor = self.data_sensor[self.data_sensor['sensor_name']]
 
         #   Setup Paths
 
         self.support_data_observatory = support_data_telescope if support_data_telescope.endswith('/') else support_data_telescope + '/'
-        support_data_wcc = config_stp_wcc.get_data_path()
+        support_data_wcc = support_data_wcc if support_data_wcc.endswith('/') else support_data_wcc + '/'
         self.jitter_rms         = self.data_observatory['observatory']['pointing']['jitter_rms']
         self.diameter_primary = self.data_observatory['telescope']['optics']['m1']['aper_clear_OD']
         self.surf_area = np.pi * (0.5 * self.diameter_primary['value']) ** 2
@@ -291,8 +344,8 @@ class Observatory:
 
         #   Fixed units here, when passing this area to countrate(area=<>) the default assumption is cm^2
         self.surf_area *= (u.meter * u.meter)
-        self.sensor_temp        = self.data_wcc['common_params']['sensor']['temp_nominal']
-        self.gain_setting = self.data_wcc['common_params']['sensor']['gain']
+        self.sensor_temp        = self.data_sensor['temp_nominal']
+        self.gain_setting = self.data_sensor['gain']
         if bg_sb is None:
             self.bg_surface_brightness = float(self.data_observatory['astrophysics']['zodi']['zodi_mag_r'])
         else:
@@ -301,7 +354,7 @@ class Observatory:
         if sensor:
             # Add STP sensor
             if plot:
-                print("Adding Sensor")
+                self.logger.info("Adding Sensor")
             self.add_sensor( num_curves=1
                            , gain_setting= self.gain_setting # (0.1 dB)
                            , sensor_temp = self.sensor_temp
@@ -311,17 +364,17 @@ class Observatory:
                            , dark_current = None
                            , read_noise = None
                            , well_depth = None
-                           , sensor_toml = self.data_wcc['common_params']['sensor']
+                           , sensor_toml = self.data_sensor
                            , support_data_path=support_data_wcc
                            , plot=plot
-                           , plot_title = "ZWO_ASI6200MM"
+                           , plot_title = self.data_sensor['qe'].split('/')[-2]   # Sensor directory name, e.g. ZWO_ASI6200MM
                            )
 
         # Add mirrors
 
         if mirrors:
             if plot:
-                print("Adding Mirrors")
+                self.logger.info("Adding Mirrors")
             self.add_mirror(self.data_observatory['telescope']['optics']['m1']['coating_refl'], num_curves=1, support_data_path=self.support_data_observatory, plot=plot, plot_title="M1")   # M1
             self.add_mirror(self.data_observatory['telescope']['optics']['m2']['coating_refl'], num_curves=1, support_data_path=self.support_data_observatory, plot=plot, plot_title="M2")   # M2
             self.add_mirror(self.data_observatory['telescope']['optics']['m3']['coating_refl'], num_curves=1, support_data_path=self.support_data_observatory, plot=plot, plot_title="M3")   # M3
@@ -330,7 +383,7 @@ class Observatory:
 
         if filters:
             if plot:
-                print("Adding Filters")
+                self.logger.info("Adding Filters")
             # Add filter (Option for not using a filter)
             self.add_filter(filter_fits_file=self.data_wcc['WCC_ETC']['filters']['filter'], wave_unit='angstrom'
                             , num_curves=1, support_data_path=support_data_wcc, plot=plot, plot_title=self.data_wcc['WCC_ETC']['filters']['filter'])
@@ -503,7 +556,7 @@ class Observatory:
                 try:
                     self.calculate_bg_normalization_magnitude()
                 except:
-                    print("Error: Could not calculate Background magnitude from inputs, reverting to default SB of 22.5")
+                    self.logger.error("Could not calculate Background magnitude from inputs, reverting to default SB of 22.5")
                     self.bg_surface_brightness = 22.5
                     self.calculate_bg_normalization_magnitude()
             bg_mag = self.bg_magnitude
@@ -544,7 +597,7 @@ class Observatory:
                 try:
                     self.calculate_bg_normalization_magnitude()
                 except:
-                    print("Error: Could not calculate Background magnitude.")
+                    self.logger.error("Could not calculate Background magnitude.")
                     exit()
             bg_mag = self.bg_magnitude
         else:
@@ -595,18 +648,18 @@ class Observatory:
     def calc_saturation_time(self):
         # Calculates the time for any one pixel on a sensor to completely fill it's well-depth.
         # NOTE: Requires setting of source and/or background and performing 'make_observation'
-        return self.well_depth / ( (self.source_counts / self.num_psf_pixels) + (self.sky_counts / self.num_psf_pixels) )
+        return self.well_depth / ( (self.encircled_energy * self.source_counts / self.num_psf_pixels) + (self.sky_counts / self.num_psf_pixels) )
 
     def calc_SNR(self, int_time, exp_time, get_variance=False):
         # Calculate SNR for a given total integration time with set frame exposure times
         # NOTE: Requires setting of source and/or background and performing 'make_observation'
 
-        total_noise = sqrt( self.source_counts*int_time + self.sky_counts*int_time
+        total_noise = sqrt( self.encircled_energy * self.source_counts*int_time + self.sky_counts*int_time
                               + ( self.dark_current + self.read_noise*self.read_noise/exp_time)*int_time*self.num_psf_pixels)
-        snr = self.source_counts*int_time / total_noise
+        snr = self.encircled_energy * self.source_counts*int_time / total_noise
 
         if get_variance==True:
-            var_list = [self.source_counts*int_time, self.sky_counts*int_time, self.dark_current*int_time*self.num_psf_pixels, + self.read_noise*self.read_noise/exp_time*int_time*self.num_psf_pixels]
+            var_list = [self.encircled_energy * self.source_counts*int_time, self.sky_counts*int_time, self.dark_current*int_time*self.num_psf_pixels, + self.read_noise*self.read_noise/exp_time*int_time*self.num_psf_pixels]
             return snr.value, var_list
         else:
             return snr.value
@@ -616,17 +669,21 @@ class Observatory:
         # NOTE: Requires setting of source and/or background and performing 'make_observation'
         
         snr = snr * sqrt(1.0 * u.ct)  # to ensure units match
-        A = ((self.source_counts/snr)**2) * exp_time
-        B = self.source_counts*exp_time + self.sky_counts*exp_time + ( self.dark_current*exp_time + self.read_noise*self.read_noise)*self.num_psf_pixels
+        A = ((self.encircled_energy * self.source_counts/snr)**2) * exp_time
+        B = self.encircled_energy * self.source_counts*exp_time + self.sky_counts*exp_time + ( self.dark_current*exp_time + self.read_noise*self.read_noise)*self.num_psf_pixels
         int_time = B/A
 
         return int_time * u.electron / u.ct
 
     def calc_zero_mag(self, flux=0, plot=False):
-        zero_mag_counts, sky_counts = self.make_observation(flux=flux, flux_units=u.ABmag
-                                                            , bg_flux=self.bg_magnitude, bg_flux_units=u.ABmag
+        #   make_observation overwrites the source and sky counts, preserve the current observation.
+        #   bg_flux=None uses the existing background magnitude. Passing self.bg_magnitude would apply the PSF area twice.
+        source_counts, sky_counts = self.source_counts, self.sky_counts
+        zero_mag_counts, _ = self.make_observation(flux=flux, flux_units=u.ABmag
+                                                            , bg_flux=None, bg_flux_units=u.ABmag
                                                             , plot=plot)
         self.zero_mag_counts = zero_mag_counts
+        self.source_counts, self.sky_counts = source_counts, sky_counts
         return
 
     def calc_req_source(self, snr, int_time, exp_time, magnitude=False):
@@ -643,13 +700,13 @@ class Observatory:
         A = int_time/snr/snr
         B = -1
         C = -1 * (self.sky_counts + self.num_psf_pixels * ( self.dark_current + self.read_noise*self.read_noise/exp_time))
-        req_source_counts = (-B/2/A.value)*(1+sqrt(1-(4*A*C/B/B).value))
+        req_source_counts = (-B/2/A.value)*(1+sqrt(1-(4*A*C/B/B).value)) / self.encircled_energy
 
         if magnitude==False:
             return req_source_counts
         
         elif magnitude==True:            
-            mag = -2.5 * log10(req_source_counts/self.zero_mag_counts.value)
+            mag = -2.5 * np.log10(req_source_counts/self.zero_mag_counts.value)
             return mag, self.filters
 
 
@@ -663,9 +720,54 @@ class Observatory:
         self.bg_magnitude = self.bg_surface_brightness - 2.5 * np.log10(self.psf_area.value)
         return
 
+    def make_jitter_interpolator(self):
+
+        data = np.loadtxt(f'{self.data_path}encircled_energy_SLOAN_SDSSrprime_filter_AgMirrors.csv')
+
+        r_vals = np.unique(data[:, 0])
+        jitter_vals = np.unique(data[:, 1])
+        EEvals = data[:, 2]
+
+        EE = EEvals.reshape(len(jitter_vals), len(r_vals))
+        self.jitter_interpolator = RegularGridInterpolator((jitter_vals, r_vals), EE,bounds_error=False,fill_value=None)
+        r_vals = None
+        jitter_vals = None
+        EE = None
+
+        return
+
+    def set_encircled_energy(self, aperture_diameter=70, jitter=None):
+        """
+        Calculates the encircled energy factor for the given PSF.
+        :param aperture_diameter: Aperture over which Encircled Energy is calculated, default 70 milliarcseconds
+        :param jitter: jitter for the whole system, if no value is provided, defaults to the observatory jitter default
+        :return: None
+        """
+        if self.jitter_interpolator is None:
+            self.make_jitter_interpolator()
+
+        #   Note: A jitter of None doesn't mean no jitter, it means default to the observatory jitter.
+        #   To compute no jitter, pass jitter=0 instead.
+        if jitter is None:
+            jitter = self.jitter_rms['value']*1e3   #   Convert toml default value in arcseconds to milliarcseconds
+
+        pts = np.column_stack([
+            np.atleast_1d(jitter),
+            np.atleast_1d(aperture_diameter)
+        ])
+
+        self.encircled_energy = self.jitter_interpolator(pts)
+
+        return
+
     def set_gain(self, gain):
         # Set gain
         self.gain = gain
+
+    def set_bg_sb(self,bg_sb=22.5):
+        self.bg_surface_brightness = bg_sb
+        self.calculate_bg_normalization_magnitude()
+        return
 
     def set_dark_current(self, dark_current):
         # Set dark current
@@ -690,7 +792,7 @@ class Observatory:
     def get_info(self):
         # Get info as strings
         for key, value in self.__dict__.items():
-            print(f'***__{key}={value}', '\n')
+            self.logger.info(f'***__{key}={value}\n')
 
     def as_array(self):
         # Get info as array
